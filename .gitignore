@@ -34,3 +34,6 @@ debug_*.py
 test_*.py
 !test/services/test_*.py
 streamlit.log
+
+client_secrets.json
+youtube_credentials.json

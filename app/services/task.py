@@ -8,9 +8,9 @@ from loguru import logger
 from app.config import config
 from app.models import const
 from app.models.schema import VideoConcatMode, VideoParams
-from app.services import llm, material, subtitle, video, voice, upload_post
+from app.services import llm, material, subtitle, video, voice, upload_post, youtube
 from app.services import state as sm
-from app.utils import file_security, utils
+from app.utils import utils
 
 
 def generate_script(task_id, params):
@@ -39,14 +39,8 @@ def generate_terms(task_id, params, video_script):
     logger.info("\n\n## generating video terms")
     video_terms = params.video_terms
     if not video_terms:
-        # 开启素材按文案顺序匹配后，关键词本身也必须按脚本叙事顺序生成；
-        # 否则后续即使顺序下载和顺序拼接，也只能复用一组全局主题词，
-        # 无法改善“后面内容的画面提前出现”的问题。
         video_terms = llm.generate_terms(
-            video_subject=params.video_subject,
-            video_script=video_script,
-            amount=8 if params.match_materials_to_script else 5,
-            match_script_order=params.match_materials_to_script,
+            video_subject=params.video_subject, video_script=video_script, amount=5
         )
     else:
         if isinstance(video_terms, str):
@@ -78,45 +72,6 @@ def save_script_data(task_id, video_script, video_terms, params):
         f.write(utils.to_json(script_data))
 
 
-def resolve_custom_audio_file(task_id: str, custom_audio_file: str | None) -> str:
-    requested_file = (custom_audio_file or "").strip()
-    if not requested_file:
-        return ""
-
-    task_dir = utils.task_dir(task_id)
-    try:
-        return file_security.resolve_path_within_directory(
-            task_dir,
-            requested_file,
-        )
-    except ValueError as exc:
-        task_dir_error = exc
-
-    server_audio_file = path.realpath(
-        requested_file
-        if path.isabs(requested_file)
-        else path.join(utils.root_dir(), requested_file)
-    )
-    if not path.isabs(requested_file):
-        project_root = path.realpath(utils.root_dir())
-        try:
-            if path.commonpath([project_root, server_audio_file]) != project_root:
-                raise ValueError(
-                    "relative custom audio paths must stay within the project directory"
-                )
-        except ValueError as exc:
-            raise ValueError(
-                "custom audio file must be task-local or an existing server-side file"
-            ) from exc
-
-    if not path.isfile(server_audio_file):
-        raise ValueError(
-            "custom audio file does not exist or is not a file"
-        ) from task_dir_error
-
-    return server_audio_file
-
-
 def generate_audio(task_id, params, video_script):
     '''
     Generate audio for the video script.
@@ -131,21 +86,14 @@ def generate_audio(task_id, params, video_script):
     logger.info("\n\n## generating audio")
     # /audio 和 /subtitle 请求模型不包含 custom_audio_file，
     # 这里统一做兼容读取，避免直调接口时抛属性错误。
-    requested_custom_audio_file = getattr(params, "custom_audio_file", None)
-    try:
-        custom_audio_file = resolve_custom_audio_file(
-            task_id, requested_custom_audio_file
-        )
-    except ValueError as exc:
-        logger.error(
-            "custom audio file is invalid, "
-            f"task_id: {task_id}, path: {requested_custom_audio_file}, error: {str(exc)}"
-        )
-        sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
-        return None, None, None
-
-    if not custom_audio_file:
-        logger.info("no custom audio file provided, using TTS to generate audio.")
+    custom_audio_file = getattr(params, "custom_audio_file", None)
+    if not custom_audio_file or not os.path.exists(custom_audio_file):
+        if custom_audio_file:
+            logger.warning(
+                f"custom audio file not found: {custom_audio_file}, using TTS to generate audio."
+            )
+        else:
+            logger.info("no custom audio file provided, using TTS to generate audio.")
         audio_file = path.join(utils.task_dir(task_id), "audio.mp3")
         sub_maker = voice.tts(
             text=video_script,
@@ -230,21 +178,14 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
         return [material_info.url for material_info in materials]
     else:
         logger.info(f"\n\n## downloading videos from {params.video_source}")
-        # 顺序匹配模式只在用户显式开启时生效。这里强制素材下载按关键词顺序
-        # 轮询，避免某个早期关键词下载太多素材，把后续脚本主题挤出最终时间线。
         downloaded_videos = material.download_videos(
             task_id=task_id,
             search_terms=video_terms,
             source=params.video_source,
             video_aspect=params.video_aspect,
-            video_concat_mode=(
-                VideoConcatMode.sequential
-                if params.match_materials_to_script
-                else params.video_concat_mode
-            ),
+            video_concat_mode=params.video_concat_mode,
             audio_duration=audio_duration * params.video_count,
             max_clip_duration=params.video_clip_duration,
-            match_script_order=params.match_materials_to_script,
         )
         if not downloaded_videos:
             sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
@@ -260,14 +201,9 @@ def generate_final_videos(
 ):
     final_video_paths = []
     combined_video_paths = []
-    # 多视频生成默认会打散素材以增加差异；但“按文案顺序匹配素材”追求的是
-    # 时间线稳定性和可解释性，所以开启后所有输出都使用顺序拼接。
-    if params.match_materials_to_script:
-        video_concat_mode = VideoConcatMode.sequential
-    elif params.video_count == 1:
-        video_concat_mode = params.video_concat_mode
-    else:
-        video_concat_mode = VideoConcatMode.random
+    video_concat_mode = (
+        params.video_concat_mode if params.video_count == 1 else VideoConcatMode.random
+    )
     video_transition_mode = params.video_transition_mode
 
     _progress = 50
@@ -419,39 +355,71 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
         f"task {task_id} finished, generated {len(final_video_paths)} videos."
     )
 
-    # 7. Cross-post to social platforms (if enabled)
+    # 7. Cross-post to TikTok/Instagram (if enabled)
     cross_post_results = []
     if upload_post.upload_post_service.is_configured() and upload_post.upload_post_service.auto_upload:
-        platforms = upload_post.upload_post_service.platforms
-        logger.info(f"\n\n## cross-posting videos to {', '.join(platforms)}")
-
-        youtube_extra = None
-        if "youtube" in platforms:
-            metadata = llm.generate_social_metadata(
-                video_subject=params.video_subject,
-                video_script=video_script,
-                language=params.video_language or "",
-                platform="youtube_shorts",
-            )
-            youtube_extra = {
-                "youtube_title": metadata.get("title", params.video_subject),
-                "youtube_description": metadata.get("caption", ""),
-                "tags": metadata.get("hashtags", []),
-                "privacyStatus": upload_post.upload_post_service.youtube_privacy_status,
-                "containsSyntheticMedia": True,
-            }
-
+        logger.info("\n\n## cross-posting videos to TikTok/Instagram")
         for video_path in final_video_paths:
             result = upload_post.cross_post_video(
                 video_path=video_path,
-                title=params.video_subject or "Check out this video! #shorts #viral",
-                youtube_extra=youtube_extra,
+                title=params.video_subject or "Check out this video! #shorts #viral"
             )
             cross_post_results.append(result)
             if result.get('success'):
                 logger.info(f"✅ Cross-posted: {video_path}")
             else:
                 logger.warning(f"⚠️ Failed to cross-post: {video_path} - {result.get('error', 'Unknown error')}")
+
+    # 8. Auto-upload to YouTube (if enabled)
+    youtube_upload_results = []
+    if youtube.youtube_service.is_configured() and youtube.youtube_service.auto_upload:
+        logger.info("\n\n## uploading videos to YouTube")
+        for i, video_path in enumerate(final_video_paths):
+            logger.info(f"Generating AI YouTube metadata for video {i + 1}/{len(final_video_paths)}...")
+            try:
+                subject_var = params.video_subject
+                if len(final_video_paths) > 1:
+                    subject_var = f"{params.video_subject} (variation {i + 1})"
+
+                metadata = llm.generate_social_metadata(
+                    video_subject=subject_var,
+                    video_script=video_script,
+                    language=params.video_language or "auto",
+                    platform="youtube_shorts"
+                )
+                
+                title = metadata.get("title") or f"{params.video_subject}"
+                if len(final_video_paths) > 1 and f"{i + 1}" not in title:
+                    title = f"{title} - Part {i + 1}"
+                
+                # Combine caption and hashtags for description
+                hashtags_list = metadata.get("hashtags", [])
+                hashtags_str = " ".join(hashtags_list)
+                description = f"{metadata.get('caption', '')}\n\n{hashtags_str}\n\nWorld Beneath."
+                
+                # Strip '#' from hashtags to get raw tags
+                tags = [tag.lstrip("#") for tag in hashtags_list]
+                if not tags:
+                    tags = ["shorts"]
+            except Exception as e:
+                logger.error(f"Failed to generate AI YouTube metadata: {e}")
+                title = params.video_subject or "AI Short Video"
+                if len(final_video_paths) > 1:
+                    title = f"{title} - Part {i + 1}"
+                description = f"World Beneath.\nSubject: {params.video_subject}\n\n#shorts #WorldBeneath"
+                tags = ["shorts"]
+
+            result = youtube.youtube_service.upload_video(
+                video_path=video_path,
+                title=title,
+                description=description,
+                tags=tags
+            )
+            youtube_upload_results.append(result)
+            if result.get('success'):
+                logger.info(f"✅ YouTube uploaded: {video_path} - Video ID: {result.get('video_id')}")
+            else:
+                logger.warning(f"⚠️ Failed to upload to YouTube: {video_path} - {result.get('error', 'Unknown error')}")
 
     kwargs = {
         "videos": final_video_paths,
